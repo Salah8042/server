@@ -1,5 +1,4 @@
 const express = require("express");
-const admin = require("firebase-admin");
 const crypto = require("crypto");
 const rateLimit = require("express-rate-limit");
 
@@ -14,30 +13,9 @@ app.use(rateLimit({
   max: 20
 }));
 
-// 🔥 Firebase init
-admin.initializeApp({
-  credential: admin.credential.applicationDefault()
-});
-
-// 🔥 Fake DB (غيرها بعدين)
+// 🔥 Fake DB
 let users = {};
 let usedNonces = {};
-
-
-// 🔐 Firebase Auth
-async function verifyFirebase(req, res, next) {
-  const token = req.headers.firebase;
-
-  if (!token) return res.send("No Firebase");
-
-  try {
-    const decoded = await admin.auth().verifyIdToken(token);
-    req.user = decoded;
-    next();
-  } catch {
-    res.send("Invalid Firebase");
-  }
-}
 
 
 // 🔐 Signature + Anti Replay
@@ -74,8 +52,10 @@ function verifySign(req, res, next) {
 
 
 // 💰 BONUS API
-app.post("/reward", verifyFirebase, verifySign, (req, res) => {
-  const uid = req.user.uid;
+app.post("/reward", verifySign, (req, res) => {
+  const { uid } = req.body;
+
+  if (!uid) return res.send("no uid");
 
   if (!users[uid]) {
     users[uid] = {
@@ -96,8 +76,8 @@ app.post("/reward", verifyFirebase, verifySign, (req, res) => {
 
 
 // 📊 BALANCE
-app.get("/balance", verifyFirebase, (req, res) => {
-  const uid = req.user.uid;
+app.get("/balance", (req, res) => {
+  const { uid } = req.query;
 
   if (!users[uid]) {
     return res.send({ balance: 0 });
@@ -107,15 +87,15 @@ app.get("/balance", verifyFirebase, (req, res) => {
 });
 
 
-// 👿 Honeypot (Trap)
+// 👿 Honeypot
 app.post("/hack", (req, res) => {
-  console.log("Hacker detected:", req.ip);
+  console.log("Hacker:", req.ip);
   res.send("Logged 👿");
 });
 
 
 app.get("/", (req, res) => {
-  res.send("ULTRA SECURE SERVER 🔥");
+  res.send("Server running 🔥");
 });
 
 
