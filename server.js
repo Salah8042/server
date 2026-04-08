@@ -13,12 +13,12 @@ const SECRET = "super_secret_key_123";
 /* 🔥 Rate Limit */
 const limiter = rateLimit({
     windowMs: 60 * 1000,
-    max: 10
+    max: 20
 });
 app.use(limiter);
 
-/* 🔥 Firebase Admin */
-const serviceAccount = require("./serviceAccount.json");
+/* 🔥 Firebase من ENV */
+const serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
 
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
@@ -56,12 +56,12 @@ app.post("/reward", async (req, res) => {
 
         const { timestamp, sign, deviceId } = req.body;
 
-        // 🔐 Signature check
+        // 🔐 Signature
         if (!verifySignature(uid, timestamp, sign)) {
             return res.status(403).send("tampered");
         }
 
-        // ⏱️ Timestamp check
+        // ⏱️ Timestamp (30 ثانية)
         if (Math.abs(Date.now() - timestamp) > 30000) {
             return res.status(403).send("expired");
         }
@@ -102,6 +102,8 @@ app.get("/balance", async (req, res) => {
         }
 
         const token = req.headers["authorization"];
+        if (!token) return res.status(401).send("no token");
+
         const decoded = await admin.auth().verifyIdToken(token);
         const uid = decoded.uid;
 
@@ -123,4 +125,6 @@ app.get("/", (req, res) => {
     res.send("🔥 Secure Server Running 🔥");
 });
 
-app.listen(3000, () => console.log("🔥 Server Ready 🔥")); 
+/* 🚀 تشغيل */
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("🔥 Server Ready 🔥"));
