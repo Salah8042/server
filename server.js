@@ -72,12 +72,12 @@ app.post("/reward", async (req, res) => {
         // 👇 أول مرة
         if (!snapshot.exists()) {
             await ref.set({
-                balance: 3,
+                balance: 5,
                 deviceId: deviceId,
                 createdAt: Date.now()
             });
 
-            return res.send({ balance: 3 });
+            return res.send({ balance: 5 });
         }
 
         const data = snapshot.val();
