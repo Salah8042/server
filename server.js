@@ -1,3 +1,5 @@
+require("dotenv").config();
+
 const express = require("express");
 const admin = require("firebase-admin");
 const crypto = require("crypto");
@@ -6,28 +8,34 @@ const rateLimit = require("express-rate-limit");
 const app = express();
 app.use(express.json());
 
+/* 🔐 ENV CHECK */
+if (!process.env.FIREBASE_CONFIG || !process.env.SECRET || !process.env.API_KEY) {
+    console.error("❌ Missing ENV variables");
+    process.exit(1);
+}
+
 /* 🔐 مفاتيح */
-const API_KEY = "salah_secret_999";
-const SECRET = "super_secret_key_123";
+const API_KEY = process.env.API_KEY;
+const SECRET = process.env.SECRET;
 
 /* 🔥 Rate Limit */
 const limiter = rateLimit({
     windowMs: 60 * 1000,
-    max: 20
+    max: 10
 });
 app.use(limiter);
 
-/* 🔥 Firebase من ENV */
+/* 🔥 Firebase */
 const serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
 
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
-    databaseURL: "https://sample-firebase-ai-app-7d182-default-rtdb.firebaseio.com"
+    databaseURL: process.env.DB_URL
 });
 
 const db = admin.database();
 
-/* 🔐 التوقيع */
+/* 🔐 توليد التوقيع */
 function generateHash(uid, timestamp) {
     return crypto
         .createHash("sha256")
@@ -39,75 +47,85 @@ function verifySignature(uid, timestamp, sign) {
     return generateHash(uid, timestamp) === sign;
 }
 
-/* 🎁 reward */
-app.post("/reward", async (req, res) => {
+/* 🔐 Middleware حماية */
+async function authMiddleware(req, res, next) {
     try {
-        // 🔐 API KEY
+        // API KEY
         if (req.headers["x-api-key"] !== API_KEY) {
             return res.status(403).send("forbidden");
         }
 
-        // 🔐 Firebase Token
-        const token = req.headers["authorization"];
+        // Token
+        const token = req.headers["authorization"]?.split(" ")[1];
         if (!token) return res.status(401).send("no token");
 
         const decoded = await admin.auth().verifyIdToken(token);
-        const uid = decoded.uid;
 
+        req.uid = decoded.uid;
+        next();
+    } catch (e) {
+        console.error(e);
+        res.status(401).send("invalid");
+    }
+}
+
+/* 🎁 reward */
+app.post("/reward", authMiddleware, async (req, res) => {
+    try {
         const { timestamp, sign, deviceId } = req.body;
 
-        // 🔐 Signature
-        if (!verifySignature(uid, timestamp, sign)) {
+        // تحقق البيانات
+        if (!timestamp || !sign || !deviceId) {
+            return res.status(400).send("missing data");
+        }
+
+        // Signature
+        if (!verifySignature(req.uid, timestamp, sign)) {
             return res.status(403).send("tampered");
         }
 
-        // ⏱️ Timestamp (30 ثانية)
+        // Timestamp (30 ثانية)
         if (Math.abs(Date.now() - timestamp) > 30000) {
             return res.status(403).send("expired");
         }
 
-        const ref = db.ref("users/" + uid);
-        const snapshot = await ref.once("value");
+        const ref = db.ref("users/" + req.uid);
 
-        // 👇 أول مرة
-        if (!snapshot.exists()) {
-            await ref.set({
-                balance: 5,
-                deviceId: deviceId,
-                createdAt: Date.now()
-            });
+        const result = await ref.transaction((current) => {
+            // أول مرة
+            if (current === null) {
+                return {
+                    balance: 5,
+                    deviceId: deviceId,
+                    createdAt: Date.now(),
+                    lastReward: Date.now()
+                };
+            }
 
-            return res.send({ balance: 5 });
-        }
+            // Device Lock
+            if (current.deviceId && current.deviceId !== deviceId) {
+                return; // abort
+            }
 
-        const data = snapshot.val();
+            return current;
+        });
 
-        // 🔒 Device Lock
-        if (data.deviceId && data.deviceId !== deviceId) {
+        if (!result.committed) {
             return res.status(403).send("device mismatch");
         }
 
-        res.send({ balance: data.balance });
+        res.send({ balance: result.snapshot.val().balance });
 
     } catch (e) {
-        res.status(401).send("invalid");
+        console.error(e);
+        res.status(500).send("error");
     }
 });
 
 /* 💰 balance */
-app.get("/balance", async (req, res) => {
+app.get("/balance", authMiddleware, async (req, res) => {
     try {
-        if (req.headers["x-api-key"] !== API_KEY) {
-            return res.status(403).send("forbidden");
-        }
-
-        const token = req.headers["authorization"];
-        if (!token) return res.status(401).send("no token");
-
-        const decoded = await admin.auth().verifyIdToken(token);
-        const uid = decoded.uid;
-
-        const snapshot = await db.ref("users/" + uid).once("value");
+        const snapshot = await db.ref("users/" + req.uid).once("value");
 
         if (!snapshot.exists()) {
             return res.send({ balance: 0 });
@@ -116,7 +134,8 @@ app.get("/balance", async (req, res) => {
         res.send({ balance: snapshot.val().balance });
 
     } catch (e) {
-        res.status(401).send("invalid");
+        console.error(e);
+        res.status(500).send("error");
     }
 });
 
