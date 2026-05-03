@@ -1,139 +1,64 @@
-const express = require("express");
-const admin = require("firebase-admin");
-const crypto = require("crypto");
-const rateLimit = require("express-rate-limit");
+require('dotenv').config();
+const express = require('express');
+const admin = require('firebase-admin');
 
 const app = express();
 app.use(express.json());
 
-/* 🔐 ENV Check */
-if (!process.env.FIREBASE_CONFIG || !process.env.DB_URL || !process.env.API_KEY || !process.env.SECRET) {
-    console.error("❌ Missing ENV variables");
-    process.exit(1);
-}
-
-/* 🔐 ENV */
-const API_KEY = process.env.API_KEY;
-const SECRET = process.env.SECRET;
-
-/* 🔥 Rate Limit */
-const limiter = rateLimit({
-    windowMs: 60 * 1000,
-    max: 30
-});
-app.use(limiter);
-
-/* 🔥 Firebase */
-let serviceAccount;
-
-try {
-    serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
-} catch (e) {
-    console.error("❌ FIREBASE_CONFIG JSON Error");
-    process.exit(1);
-}
+// Firebase init
+const serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
 
 admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-    databaseURL: process.env.DB_URL
+  credential: admin.credential.cert(serviceAccount),
+  databaseURL: process.env.DB_URL
 });
 
 const db = admin.database();
 
-/* 🔐 Hash */
-function generateHash(uid, timestamp) {
-    return crypto
-        .createHash("sha256")
-        .update(uid + timestamp + SECRET)
-        .digest("hex");
-}
+// API
+app.post('/reward', async (req, res) => {
+  try {
+    const apiKey = req.headers['x-api-key'];
+    const token = req.headers['authorization'];
 
-function verifySignature(uid, timestamp, sign) {
-    return generateHash(uid, timestamp) === sign;
-}
-
-/* 🎁 reward */
-app.post("/reward", async (req, res) => {
-    try {
-        if (req.headers["x-api-key"] !== API_KEY) {
-            return res.status(403).send("forbidden");
-        }
-
-        const token = req.headers["authorization"];
-        if (!token) return res.status(401).send("no token");
-
-        const decoded = await admin.auth().verifyIdToken(token);
-        const uid = decoded.uid;
-
-        const { timestamp, sign, deviceId } = req.body;
-
-        if (!verifySignature(uid, timestamp, sign)) {
-            return res.status(403).send("tampered");
-        }
-
-        if (Math.abs(Date.now() - timestamp) > 30000) {
-            return res.status(403).send("expired");
-        }
-
-        const ref = db.ref("users/" + uid);
-        const snapshot = await ref.once("value");
-
-        if (!snapshot.exists()) {
-            await ref.set({
-                balance: 5,
-                deviceId: deviceId,
-                createdAt: Date.now()
-            });
-
-            return res.send({ balance: 5 });
-        }
-
-        const data = snapshot.val();
-
-        if (data.deviceId && data.deviceId !== deviceId) {
-            return res.status(403).send("device mismatch");
-        }
-
-        res.send({ balance: data.balance });
-
-    } catch (e) {
-        console.error(e);
-        res.status(401).send("invalid");
+    if (apiKey !== process.env.API_KEY) {
+      return res.status(403).json({ error: 'Invalid API key' });
     }
-});
 
-/* 💰 balance */
-app.get("/balance", async (req, res) => {
-    try {
-        if (req.headers["x-api-key"] !== API_KEY) {
-            return res.status(403).send("forbidden");
-        }
-
-        const token = req.headers["authorization"];
-        if (!token) return res.status(401).send("no token");
-
-        const decoded = await admin.auth().verifyIdToken(token);
-        const uid = decoded.uid;
-
-        const snapshot = await db.ref("users/" + uid).once("value");
-
-        if (!snapshot.exists()) {
-            return res.send({ balance: 0 });
-        }
-
-        res.send({ balance: snapshot.val().balance });
-
-    } catch (e) {
-        console.error(e);
-        res.status(401).send("invalid");
+    if (!token) {
+      return res.status(401).json({ error: 'No token' });
     }
+
+    const decoded = await admin.auth().verifyIdToken(token);
+    const uid = decoded.uid;
+
+    const userRef = db.ref('users/' + uid);
+    const snapshot = await userRef.get();
+
+    let balance = 0;
+
+    if (snapshot.exists()) {
+      balance = snapshot.val().balance || 0;
+    }
+
+    balance += 10;
+
+    await userRef.set({
+      balance: balance
+    });
+
+    res.json({ balance });
+
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-/* 🟢 test */
-app.get("/", (req, res) => {
-    res.send("🔥 Server Running OK 🔥");
+app.get('/', (req, res) => {
+  res.send('🔥 Server Running 🔥');
 });
 
-/* 🚀 Start */
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("🔥 Server Ready 🔥"));
+app.listen(process.env.PORT || 3000, () => {
+  console.log('Server started');
+});
