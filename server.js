@@ -75,7 +75,7 @@ app.post("/reward", authMiddleware, async (req, res) => {
     const result = await userRef.transaction((current) => {
       if (current === null) {
         return {
-          balance: 11,
+          balance: 10,
           rewarded: true,
           deviceId,
           createdAt: now,
@@ -98,7 +98,7 @@ app.post("/reward", authMiddleware, async (req, res) => {
 
       return {
         ...current,
-        balance: 11,
+        balance: 10,
         rewarded: true,
         deviceId: current.deviceId || deviceId,
         updatedAt: now,
