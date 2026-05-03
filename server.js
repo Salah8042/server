@@ -5,22 +5,26 @@ const rateLimit = require("express-rate-limit");
 const app = express();
 app.use(express.json());
 
-if (!process.env.FIREBASE_CONFIG || !process.env.DB_URL) {
+const FIREBASE_CONFIG = process.env.FIREBASE_CONFIG;
+const DB_URL = process.env.DB_URL;
+const API_KEY = process.env.API_KEY;
+
+if (!FIREBASE_CONFIG || !DB_URL || !API_KEY) {
   console.error("Missing ENV variables");
   process.exit(1);
 }
 
 let serviceAccount;
 try {
-  serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
+  serviceAccount = JSON.parse(FIREBASE_CONFIG);
 } catch (e) {
-  console.error("FIREBASE_CONFIG is invalid JSON");
+  console.error("FIREBASE_CONFIG invalid");
   process.exit(1);
 }
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  databaseURL: process.env.DB_URL,
+  databaseURL: DB_URL,
 });
 
 const db = admin.database();
@@ -34,100 +38,85 @@ app.use(
   })
 );
 
-function getBearerToken(req) {
+function bearerToken(req) {
   const auth = req.headers.authorization || "";
   return auth.startsWith("Bearer ") ? auth.slice(7) : auth;
 }
 
-async function authMiddleware(req, res, next) {
+async function authGuard(req, res, next) {
   try {
-    const token = getBearerToken(req);
-    if (!token) {
+    if (req.headers["x-api-key"] !== API_KEY) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+
+    const idToken = bearerToken(req);
+    if (!idToken) {
       return res.status(401).json({ error: "no token" });
     }
 
-    const decoded = await admin.auth().verifyIdToken(token);
+    const decoded = await admin.auth().verifyIdToken(idToken);
     req.uid = decoded.uid;
-    req.email = decoded.email || "";
-    req.name = decoded.name || "";
     next();
   } catch (e) {
-    console.error("auth error:", e);
-    return res.status(401).json({ error: "invalid" });
+    console.error("authGuard:", e);
+    return res.status(401).json({ error: "invalid token" });
+  }
+}
+
+async function appCheckGuard(req, res, next) {
+  try {
+    const appCheckToken = req.headers["x-firebase-appcheck"];
+    if (!appCheckToken) {
+      return res.status(401).json({ error: "missing appcheck" });
+    }
+
+    await admin.appCheck().verifyToken(appCheckToken);
+    next();
+  } catch (e) {
+    console.error("appCheckGuard:", e);
+    return res.status(401).json({ error: "invalid appcheck" });
   }
 }
 
 app.get("/", (req, res) => {
-  res.send("🔥 Server Running OK 🔥");
+  res.send("🔥 Server Ready 🔥");
 });
 
-app.post("/reward", authMiddleware, async (req, res) => {
+app.post("/init", authGuard, appCheckGuard, async (req, res) => {
   try {
     const deviceId = String(req.body?.deviceId || "").trim();
-
     if (!deviceId) {
       return res.status(400).json({ error: "missing deviceId" });
     }
 
-    const now = Date.now();
-    const userRef = db.ref(`users/${req.uid}`);
+    const ref = db.ref(`users/${req.uid}`);
+    const snap = await ref.once("value");
 
-    const result = await userRef.transaction((current) => {
-      if (current === null) {
-        return {
-          balance: 10,
-          rewarded: true,
-          deviceId,
-          createdAt: now,
-          updatedAt: now,
-          lastRewardAt: now,
-        };
-      }
-
-      if (current.deviceId && current.deviceId !== deviceId) {
-        return; // abort transaction
-      }
-
-      if (current.rewarded === true) {
-        return {
-          ...current,
-          updatedAt: now,
-          deviceId: current.deviceId || deviceId,
-        };
-      }
-
-      return {
-        ...current,
+    if (!snap.exists()) {
+      await ref.set({
         balance: 10,
         rewarded: true,
-        deviceId: current.deviceId || deviceId,
-        updatedAt: now,
-        lastRewardAt: now,
-      };
-    });
-
-    if (!result.committed) {
-      return res.status(403).json({ error: "device mismatch" });
+        deviceId,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+    } else {
+      const data = snap.val() || {};
+      if (data.deviceId && data.deviceId !== deviceId) {
+        return res.status(403).json({ error: "device mismatch" });
+      }
     }
 
-    const data = result.snapshot.val() || {};
-    return res.json({
-      balance: data.balance || 0,
-      rewarded: !!data.rewarded,
-    });
+    return res.json({ success: true });
   } catch (e) {
-    console.error("reward error:", e);
+    console.error("init error:", e);
     return res.status(500).json({ error: "server error" });
   }
 });
 
-app.get("/balance", authMiddleware, async (req, res) => {
+app.get("/balance", authGuard, appCheckGuard, async (req, res) => {
   try {
     const snap = await db.ref(`users/${req.uid}`).once("value");
-    if (!snap.exists()) {
-      return res.json({ balance: 0, rewarded: false });
-    }
-
     const data = snap.val() || {};
     return res.json({
       balance: data.balance || 0,
