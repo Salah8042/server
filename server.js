@@ -1,15 +1,13 @@
 const express = require("express");
 const admin = require("firebase-admin");
-const rateLimit = require("express-rate-limit");
 
 const app = express();
 app.use(express.json());
 
 const FIREBASE_CONFIG = process.env.FIREBASE_CONFIG;
 const DB_URL = process.env.DB_URL;
-const API_KEY = process.env.API_KEY;
 
-if (!FIREBASE_CONFIG || !DB_URL || !API_KEY) {
+if (!FIREBASE_CONFIG || !DB_URL) {
   console.error("Missing ENV variables");
   process.exit(1);
 }
@@ -29,101 +27,66 @@ admin.initializeApp({
 
 const db = admin.database();
 
-app.use(
-  rateLimit({
-    windowMs: 60 * 1000,
-    max: 20,
-    standardHeaders: true,
-    legacyHeaders: false,
-  })
-);
+app.get("/", (req, res) => {
+  res.send("🔥 Server Running 🔥");
+});
 
-function bearerToken(req) {
-  const auth = req.headers.authorization || "";
-  return auth.startsWith("Bearer ") ? auth.slice(7) : auth;
-}
-
-async function authGuard(req, res, next) {
+app.post("/init", async (req, res) => {
   try {
-    if (req.headers["x-api-key"] !== API_KEY) {
-      return res.status(403).json({ error: "forbidden" });
-    }
+    const auth = req.headers.authorization || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
 
-    const idToken = bearerToken(req);
-    if (!idToken) {
+    if (!token) {
       return res.status(401).json({ error: "no token" });
     }
 
-    const decoded = await admin.auth().verifyIdToken(idToken);
-    req.uid = decoded.uid;
-    next();
-  } catch (e) {
-    console.error("authGuard:", e);
-    return res.status(401).json({ error: "invalid token" });
-  }
-}
+    const decoded = await admin.auth().verifyIdToken(token);
+    const uid = decoded.uid;
 
-async function appCheckGuard(req, res, next) {
-  try {
-    const appCheckToken = req.headers["x-firebase-appcheck"];
-    if (!appCheckToken) {
-      return res.status(401).json({ error: "missing appcheck" });
-    }
-
-    await admin.appCheck().verifyToken(appCheckToken);
-    next();
-  } catch (e) {
-    console.error("appCheckGuard:", e);
-    return res.status(401).json({ error: "invalid appcheck" });
-  }
-}
-
-app.get("/", (req, res) => {
-  res.send("🔥 Server Ready 🔥");
-});
-
-app.post("/init", authGuard, appCheckGuard, async (req, res) => {
-  try {
-    const deviceId = String(req.body?.deviceId || "").trim();
-    if (!deviceId) {
-      return res.status(400).json({ error: "missing deviceId" });
-    }
-
-    const ref = db.ref(`users/${req.uid}`);
+    const ref = db.ref("users/" + uid);
     const snap = await ref.once("value");
 
     if (!snap.exists()) {
       await ref.set({
         balance: 10,
-        rewarded: true,
-        deviceId,
         createdAt: Date.now(),
-        updatedAt: Date.now(),
       });
-    } else {
-      const data = snap.val() || {};
-      if (data.deviceId && data.deviceId !== deviceId) {
-        return res.status(403).json({ error: "device mismatch" });
-      }
+
+      return res.json({ balance: 10 });
     }
 
-    return res.json({ success: true });
+    return res.json({
+      balance: snap.val().balance || 0,
+    });
   } catch (e) {
-    console.error("init error:", e);
+    console.error(e);
     return res.status(500).json({ error: "server error" });
   }
 });
 
-app.get("/balance", authGuard, appCheckGuard, async (req, res) => {
+app.get("/balance", async (req, res) => {
   try {
-    const snap = await db.ref(`users/${req.uid}`).once("value");
-    const data = snap.val() || {};
+    const auth = req.headers.authorization || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
+
+    if (!token) {
+      return res.status(401).json({ error: "no token" });
+    }
+
+    const decoded = await admin.auth().verifyIdToken(token);
+    const uid = decoded.uid;
+
+    const snap = await db.ref("users/" + uid).once("value");
+
+    if (!snap.exists()) {
+      return res.json({ balance: 0 });
+    }
+
     return res.json({
-      balance: data.balance || 0,
-      rewarded: !!data.rewarded,
+      balance: snap.val().balance || 0,
     });
   } catch (e) {
-    console.error("balance error:", e);
+    console.error(e);
     return res.status(500).json({ error: "server error" });
   }
 });
