@@ -39,14 +39,12 @@ app.use(
   })
 );
 
-function getBearerToken(req) {
-  const auth = req.headers.authorization || "";
-  if (!auth.startsWith("Bearer ")) return null;
-  return auth.slice(7);
+function sha256Hex(text) {
+  return crypto.createHash("sha256").update(String(text)).digest("hex");
 }
 
-function randomHex(bytes = 16) {
-  return crypto.randomBytes(bytes).toString("hex");
+function hmacHex(key, data) {
+  return crypto.createHmac("sha256", String(key)).update(String(data)).digest("hex");
 }
 
 function timingSafeEqualText(a, b) {
@@ -55,8 +53,34 @@ function timingSafeEqualText(a, b) {
   return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
 }
 
-function hmacHex(key, data) {
-  return crypto.createHmac("sha256", String(key)).update(String(data)).digest("hex");
+function randomHex(bytes = 16) {
+  return crypto.randomBytes(bytes).toString("hex");
+}
+
+function canonicalJson(value) {
+  if (value === null || value === undefined) return "null";
+
+  if (Array.isArray(value)) {
+    return "[" + value.map(canonicalJson).join(",") + "]";
+  }
+
+  if (typeof value === "object") {
+    const keys = Object.keys(value).sort();
+    const items = keys.map((k) => {
+      return JSON.stringify(k) + ":" + canonicalJson(value[k]);
+    });
+    return "{" + items.join(",") + "}";
+  }
+
+  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number" || typeof value === "boolean") return JSON.stringify(value);
+
+  return JSON.stringify(String(value));
+}
+
+function bearerToken(req) {
+  const auth = req.headers.authorization || "";
+  return auth.startsWith("Bearer ") ? auth.slice(7) : null;
 }
 
 async function authGuard(req, res, next) {
@@ -65,7 +89,7 @@ async function authGuard(req, res, next) {
       return res.status(403).json({ error: "forbidden" });
     }
 
-    const token = getBearerToken(req);
+    const token = bearerToken(req);
     if (!token) {
       return res.status(401).json({ error: "no token" });
     }
@@ -79,6 +103,72 @@ async function authGuard(req, res, next) {
     console.error("authGuard:", e);
     return res.status(401).json({ error: "invalid token" });
   }
+}
+
+async function verifySignedRequest(req, uid, bodyObj) {
+  const deviceId = String(req.headers["x-device-id"] || "").trim();
+  const sessionId = String(req.headers["x-session-id"] || "").trim();
+  const timestamp = Number(req.headers["x-ts"] || 0);
+  const nonce = String(req.headers["x-nonce"] || "").trim();
+  const sign = String(req.headers["x-sign"] || "").trim();
+
+  if (!deviceId || !sessionId || !timestamp || !nonce || !sign) {
+    return { ok: false, status: 400, error: "missing signed data" };
+  }
+
+  if (Math.abs(Date.now() - timestamp) > 15000) {
+    return { ok: false, status: 403, error: "expired" };
+  }
+
+  const sessionSnap = await db.ref(`sessions/${uid}/${sessionId}`).once("value");
+  if (!sessionSnap.exists()) {
+    return { ok: false, status: 403, error: "bad session" };
+  }
+
+  const session = sessionSnap.val() || {};
+
+  if (session.used === true) {
+    return { ok: false, status: 403, error: "session used" };
+  }
+
+  if (session.deviceId !== deviceId) {
+    return { ok: false, status: 403, error: "device mismatch" };
+  }
+
+  if (session.expiresAt && Date.now() > session.expiresAt) {
+    return { ok: false, status: 403, error: "session expired" };
+  }
+
+  const bodyCanonical = canonicalJson(bodyObj || {});
+  const payload = [
+    uid,
+    req.method,
+    req.path,
+    deviceId,
+    sessionId,
+    session.challenge || "",
+    timestamp,
+    nonce,
+    bodyCanonical,
+  ].join("|");
+
+  const expected = hmacHex(session.sessionKey, payload);
+
+  if (!timingSafeEqualText(expected, sign)) {
+    return { ok: false, status: 403, error: "bad signature" };
+  }
+
+  const nonceRef = db.ref(`nonces/${uid}/${sessionId}/${nonce}`);
+  const nonceTx = await nonceRef.transaction((current) => {
+    if (current === null) return Date.now();
+    return;
+  });
+
+  if (!nonceTx.committed) {
+    return { ok: false, status: 403, error: "replay" };
+  }
+
+  return { ok: true, deviceId, sessionId, session };
 }
 
 app.get("/", (req, res) => {
@@ -123,81 +213,37 @@ app.post("/session", authGuard, async (req, res) => {
 app.post("/reward", authGuard, async (req, res) => {
   try {
     const uid = req.uid;
-    const deviceId = String(req.body?.deviceId || "").trim();
-    const sessionId = String(req.body?.sessionId || "").trim();
-    const challenge = String(req.body?.challenge || "").trim();
-    const timestamp = Number(req.body?.timestamp || 0);
-    const nonce = String(req.body?.nonce || "").trim();
-    const sign = String(req.body?.sign || "").trim();
 
-    if (!deviceId || !sessionId || !challenge || !timestamp || !nonce || !sign) {
-      return res.status(400).json({ error: "missing data" });
+    const vr = await verifySignedRequest(req, uid, req.body || {});
+    if (!vr.ok) {
+      return res.status(vr.status).json({ error: vr.error });
     }
 
-    if (Math.abs(Date.now() - timestamp) > 15000) {
-      return res.status(403).json({ error: "expired" });
-    }
-
-    const sessionRef = db.ref(`sessions/${uid}/${sessionId}`);
-    const snap = await sessionRef.once("value");
-
-    if (!snap.exists()) {
-      return res.status(403).json({ error: "bad session" });
-    }
-
-    const session = snap.val() || {};
-
-    if (session.used === true) {
-      return res.status(403).json({ error: "session used" });
-    }
-
-    if (session.deviceId !== deviceId) {
-      return res.status(403).json({ error: "device mismatch" });
-    }
-
-    if (session.challenge !== challenge) {
-      return res.status(403).json({ error: "bad challenge" });
-    }
-
-    if (session.expiresAt && Date.now() > session.expiresAt) {
-      return res.status(403).json({ error: "session expired" });
-    }
-
-    const expected = hmacHex(
-      session.sessionKey,
-      `${uid}|${sessionId}|${deviceId}|${challenge}|${timestamp}|${nonce}|reward`
-    );
-
-    if (!timingSafeEqualText(expected, sign)) {
-      return res.status(403).json({ error: "bad signature" });
-    }
-
-    const nonceRef = db.ref(`nonces/${uid}/${sessionId}/${nonce}`);
-    const nonceTx = await nonceRef.transaction((current) => {
-      if (current === null) return Date.now();
-      return;
-    });
-
-    if (!nonceTx.committed) {
-      return res.status(403).json({ error: "replay" });
-    }
+    const deviceId = vr.deviceId;
+    const sessionId = vr.sessionId;
 
     const userRef = db.ref(`users/${uid}`);
-    const rewardTx = await userRef.transaction((current) => {
+    const tx = await userRef.transaction((current) => {
+      const now = Date.now();
+
       if (current === null) {
         return {
           balance: 10,
           rewarded: true,
           deviceId,
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
+          createdAt: now,
+          updatedAt: now,
         };
+      }
+
+      if (current.deviceId && current.deviceId !== deviceId) {
+        return;
       }
 
       if (current.rewarded === true) {
         return {
           ...current,
-          updatedAt: Date.now(),
+          updatedAt: now,
         };
       }
 
@@ -206,17 +252,20 @@ app.post("/reward", authGuard, async (req, res) => {
         balance: 10,
         rewarded: true,
         deviceId: current.deviceId || deviceId,
-        updatedAt: Date.now(),
+        updatedAt: now,
       };
     });
 
-    if (!rewardTx.committed) {
-      return res.status(500).json({ error: "reward failed" });
+    if (!tx.committed) {
+      return res.status(403).json({ error: "device mismatch" });
     }
 
-    await sessionRef.update({ used: true, usedAt: Date.now() });
+    await db.ref(`sessions/${uid}/${sessionId}`).update({
+      used: true,
+      usedAt: Date.now(),
+    });
 
-    const user = rewardTx.snapshot.val() || {};
+    const user = tx.snapshot.val() || {};
     return res.json({
       balance: user.balance || 0,
       rewarded: !!user.rewarded,
@@ -229,8 +278,16 @@ app.post("/reward", authGuard, async (req, res) => {
 
 app.get("/balance", authGuard, async (req, res) => {
   try {
-    const snap = await db.ref(`users/${req.uid}`).once("value");
+    const uid = req.uid;
+
+    const vr = await verifySignedRequest(req, uid, {});
+    if (!vr.ok) {
+      return res.status(vr.status).json({ error: vr.error });
+    }
+
+    const snap = await db.ref(`users/${uid}`).once("value");
     const user = snap.val() || {};
+
     return res.json({
       balance: user.balance || 0,
       rewarded: !!user.rewarded,
