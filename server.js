@@ -1,6 +1,7 @@
 const express = require("express");
 const admin = require("firebase-admin");
 const rateLimit = require("express-rate-limit");
+const crypto = require("crypto");
 
 const app = express();
 app.use(express.json());
@@ -40,8 +41,22 @@ app.use(
 
 function getBearerToken(req) {
   const auth = req.headers.authorization || "";
-  if (auth.startsWith("Bearer ")) return auth.slice(7);
-  return null;
+  if (!auth.startsWith("Bearer ")) return null;
+  return auth.slice(7);
+}
+
+function randomHex(bytes = 16) {
+  return crypto.randomBytes(bytes).toString("hex");
+}
+
+function timingSafeEqualText(a, b) {
+  const aa = Buffer.from(String(a), "utf8");
+  const bb = Buffer.from(String(b), "utf8");
+  return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
+}
+
+function hmacHex(key, data) {
+  return crypto.createHmac("sha256", String(key)).update(String(data)).digest("hex");
 }
 
 async function authGuard(req, res, next) {
@@ -59,16 +74,6 @@ async function authGuard(req, res, next) {
     req.uid = decoded.uid;
     req.email = decoded.email || null;
     req.name = decoded.name || null;
-
-    const appCheckToken = req.headers["x-firebase-appcheck"];
-    if (appCheckToken) {
-      try {
-        await admin.appCheck().verifyToken(appCheckToken);
-      } catch (e) {
-        return res.status(401).json({ error: "invalid appcheck" });
-      }
-    }
-
     next();
   } catch (e) {
     console.error("authGuard:", e);
@@ -80,7 +85,7 @@ app.get("/", (req, res) => {
   res.send("🔥 Server Ready 🔥");
 });
 
-app.post("/init", authGuard, async (req, res) => {
+app.post("/session", authGuard, async (req, res) => {
   try {
     const uid = req.uid;
     const deviceId = String(req.body?.deviceId || "").trim();
@@ -89,49 +94,146 @@ app.post("/init", authGuard, async (req, res) => {
       return res.status(400).json({ error: "missing deviceId" });
     }
 
-    const userRef = db.ref("users/" + uid);
-    const snap = await userRef.once("value");
+    const sessionId = randomHex(16);
+    const sessionKey = randomHex(32);
+    const challenge = randomHex(16);
+    const expiresAt = Date.now() + 5 * 60 * 1000;
 
-    if (!snap.exists()) {
-      await userRef.set({
-        balance: 10,
-        rewarded: true,
-        deviceId,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      });
+    await db.ref(`sessions/${uid}/${sessionId}`).set({
+      sessionKey,
+      deviceId,
+      challenge,
+      used: false,
+      createdAt: Date.now(),
+      expiresAt,
+    });
 
-      return res.json({ balance: 10 });
+    return res.json({
+      sessionId,
+      sessionKey,
+      challenge,
+      expiresAt,
+    });
+  } catch (e) {
+    console.error("session error:", e);
+    return res.status(500).json({ error: "server error" });
+  }
+});
+
+app.post("/reward", authGuard, async (req, res) => {
+  try {
+    const uid = req.uid;
+    const deviceId = String(req.body?.deviceId || "").trim();
+    const sessionId = String(req.body?.sessionId || "").trim();
+    const challenge = String(req.body?.challenge || "").trim();
+    const timestamp = Number(req.body?.timestamp || 0);
+    const nonce = String(req.body?.nonce || "").trim();
+    const sign = String(req.body?.sign || "").trim();
+
+    if (!deviceId || !sessionId || !challenge || !timestamp || !nonce || !sign) {
+      return res.status(400).json({ error: "missing data" });
     }
 
-    const data = snap.val() || {};
+    if (Math.abs(Date.now() - timestamp) > 15000) {
+      return res.status(403).json({ error: "expired" });
+    }
 
-    if (data.deviceId && data.deviceId !== deviceId) {
+    const sessionRef = db.ref(`sessions/${uid}/${sessionId}`);
+    const snap = await sessionRef.once("value");
+
+    if (!snap.exists()) {
+      return res.status(403).json({ error: "bad session" });
+    }
+
+    const session = snap.val() || {};
+
+    if (session.used === true) {
+      return res.status(403).json({ error: "session used" });
+    }
+
+    if (session.deviceId !== deviceId) {
       return res.status(403).json({ error: "device mismatch" });
     }
 
+    if (session.challenge !== challenge) {
+      return res.status(403).json({ error: "bad challenge" });
+    }
+
+    if (session.expiresAt && Date.now() > session.expiresAt) {
+      return res.status(403).json({ error: "session expired" });
+    }
+
+    const expected = hmacHex(
+      session.sessionKey,
+      `${uid}|${sessionId}|${deviceId}|${challenge}|${timestamp}|${nonce}|reward`
+    );
+
+    if (!timingSafeEqualText(expected, sign)) {
+      return res.status(403).json({ error: "bad signature" });
+    }
+
+    const nonceRef = db.ref(`nonces/${uid}/${sessionId}/${nonce}`);
+    const nonceTx = await nonceRef.transaction((current) => {
+      if (current === null) return Date.now();
+      return;
+    });
+
+    if (!nonceTx.committed) {
+      return res.status(403).json({ error: "replay" });
+    }
+
+    const userRef = db.ref(`users/${uid}`);
+    const rewardTx = await userRef.transaction((current) => {
+      if (current === null) {
+        return {
+          balance: 10,
+          rewarded: true,
+          deviceId,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        };
+      }
+
+      if (current.rewarded === true) {
+        return {
+          ...current,
+          updatedAt: Date.now(),
+        };
+      }
+
+      return {
+        ...current,
+        balance: 10,
+        rewarded: true,
+        deviceId: current.deviceId || deviceId,
+        updatedAt: Date.now(),
+      };
+    });
+
+    if (!rewardTx.committed) {
+      return res.status(500).json({ error: "reward failed" });
+    }
+
+    await sessionRef.update({ used: true, usedAt: Date.now() });
+
+    const user = rewardTx.snapshot.val() || {};
     return res.json({
-      balance: data.balance || 0,
-      rewarded: !!data.rewarded,
+      balance: user.balance || 0,
+      rewarded: !!user.rewarded,
     });
   } catch (e) {
-    console.error("init error:", e);
+    console.error("reward error:", e);
     return res.status(500).json({ error: "server error" });
   }
 });
 
 app.get("/balance", authGuard, async (req, res) => {
   try {
-    const snap = await db.ref("users/" + req.uid).once("value");
-
-    if (!snap.exists()) {
-      return res.json({ balance: 0, rewarded: false });
-    }
-
-    const data = snap.val() || {};
+    const snap = await db.ref(`users/${req.uid}`).once("value");
+    const user = snap.val() || {};
     return res.json({
-      balance: data.balance || 0,
-      rewarded: !!data.rewarded,
+      balance: user.balance || 0,
+      rewarded: !!user.rewarded,
     });
   } catch (e) {
     console.error("balance error:", e);
